@@ -1,22 +1,39 @@
+use std::{
+    collections::HashSet,
+    hash::{Hash, Hasher},
+};
+
 use anyhow::Result;
 use chrono::{DateTime, Days, Utc};
 use fake::{
-    faker::{chrono::en::DateTimeBetween, internet::en::SafeEmail, name::zh_cn::Name}, rand, Dummy, Fake, Faker
+    Dummy, Fake, Faker,
+    faker::{chrono::en::DateTimeBetween, internet::en::SafeEmail, name::zh_cn::Name},
+    rand,
 };
 use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
+use sqlx::{Executor, PgPool};
+use tokio::time::Instant;
 
-#[derive(Debug, Clone, Dummy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Dummy, Serialize, Deserialize, PartialEq, Eq)]
+enum Gender {
+    Female,
+    Male,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Dummy, Serialize, Deserialize, PartialEq, Eq)]
 struct UserStat {
     #[dummy(faker = "UniqueEmail")]
     email: String,
     #[dummy(faker = "Name()")]
     name: String,
-    #[dummy(faker = "DateTimeBetween(start(365*5), end())")]
+    gender: Gender,
+    #[dummy(faker = "DateTimeBetween(before(365*5), before(90))")]
     created_at: DateTime<Utc>,
-    #[dummy(faker = "DateTimeBetween(start(30), end())")]
+    #[dummy(faker = "DateTimeBetween(before(30), now())")]
     last_visited_at: DateTime<Utc>,
-    #[dummy(faker = "DateTimeBetween(start(90), end())")]
+    #[dummy(faker = "DateTimeBetween(before(90), now())")]
     last_watched_at: DateTime<Utc>,
     #[dummy(faker = "IntList(50, 100000, 100000)")]
     recent_watched: Vec<i32>,
@@ -26,29 +43,134 @@ struct UserStat {
     started_but_not_finished: Vec<i32>,
     #[dummy(faker = "IntList(50, 400000, 100000)")]
     finished: Vec<i32>,
-    #[dummy(faker = "DateTimeBetween(start(45), end())")]
-    last_email_notificatiion: DateTime<Utc>,
-    #[dummy(faker = "DateTimeBetween(start(15), end())")]
+    #[dummy(faker = "DateTimeBetween(before(45), now())")]
+    last_email_notification: DateTime<Utc>,
+    #[dummy(faker = "DateTimeBetween(before(15), now())")]
     last_in_app_notification: DateTime<Utc>,
-    #[dummy(faker = "DateTimeBetween(start(90), end())")]
+    #[dummy(faker = "DateTimeBetween(before(90), now())")]
     last_sms_notification: DateTime<Utc>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let user: UserStat = Faker.fake();
-    println!("{:#?}", user);
+    let pool = PgPool::connect("postgres://vincent:vincent@localhost:5432/stats").await?;
+
+    for _ in 1..500 {
+        let users: HashSet<_> = (0..10000)
+            .into_iter()
+            .map(|_| Faker.fake::<UserStat>())
+            .collect();
+
+        let start = Instant::now();
+        let len = users.len();
+        raw_insert(users, &pool).await?;
+        println!(
+            "insert {} users cost {}ms",
+            len,
+            start.elapsed().as_millis()
+        );
+    }
 
     Ok(())
 }
 
-fn start(days: u64) -> DateTime<Utc> {
+/*
+create table user_stats(
+    email varchar(128) not null primary key,
+    name varchar(64) not null,
+    gender gender default 'unknown',
+    created_at timestamptz DEFAULT CURRENT_TIMESTAMP,
+    last_visited_at timestamptz,
+    last_watched_at timestamptz,
+    recent_watched int[],
+    viewed_but_not_started int[],
+    started_but_not_finished int[],
+    finished int[],
+    last_email_notification timestamptz,
+    last_in_app_notification timestamptz,
+    last_sms_notification timestamptz
+);
+ */
+async fn raw_insert(users: HashSet<UserStat>, pool: &PgPool) -> Result<()> {
+    let mut sql = String::with_capacity(10 * 1000 * 1000);
+    sql.push_str("
+    INSERT INTO user_stats(email, name, created_at, last_visited_at, last_watched_at, recent_watched, viewed_but_not_started, started_but_not_finished, finished, last_email_notification, last_in_app_notification, last_sms_notification)
+    VALUES");
+    for user in users {
+        sql.push_str(&format!(
+            "('{}', '{}', '{}', '{}', '{}', {}::int[], {}::int[], {}::int[], {}::int[], '{}', '{}', '{}'),",
+            user.email,
+            user.name,
+            user.created_at,
+            user.last_visited_at,
+            user.last_watched_at,
+            list_to_string(user.recent_watched),
+            list_to_string(user.viewed_but_not_started),
+            list_to_string(user.started_but_not_finished),
+            list_to_string(user.finished),
+            user.last_email_notification,
+            user.last_in_app_notification,
+            user.last_sms_notification,
+        ));
+    }
+
+    let v = &sql[..sql.len() - 1];
+    sqlx::query(v).execute(pool).await?;
+
+    Ok(())
+}
+
+fn list_to_string(list: Vec<i32>) -> String {
+    format!("ARRAY{:?}", list)
+}
+
+async fn bulk_insert(users: HashSet<UserStat>, pool: &PgPool) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
+    for user in users {
+        let query = sqlx::query(
+            r#"
+            insert into user_stats(
+                email, name, created_at, last_visited_at, last_watched_at, recent_watched,
+                viewed_but_not_started, started_but_not_finished, finished, last_email_notificatiion,
+                last_in_app_notification, last_sms_notification
+            ) values (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
+            )"#,
+        )
+        .bind(&user.email)
+        .bind(&user.name)
+        // .bind(&user.gender)
+        .bind(&user.created_at)
+        .bind(&user.last_visited_at)
+        .bind(&user.last_watched_at)
+        .bind(&user.recent_watched)
+        .bind(&user.viewed_but_not_started)
+        .bind(&user.started_but_not_finished)
+        .bind(&user.finished)
+        .bind(&user.last_email_notification)
+        .bind(&user.last_in_app_notification)
+        .bind(&user.last_sms_notification);
+
+        tx.execute(query).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+impl Hash for UserStat {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.email.hash(state);
+    }
+}
+
+fn before(days: u64) -> DateTime<Utc> {
     DateTime::from(Utc::now())
         .checked_sub_days(Days::new(days))
         .unwrap()
 }
 
-fn end() -> DateTime<Utc> {
+fn now() -> DateTime<Utc> {
     let now = Utc::now();
     DateTime::from(now)
 }
@@ -65,7 +187,6 @@ impl Dummy<IntList> for Vec<i32> {
                 start
             })
             .collect()
-
     }
 }
 
@@ -75,10 +196,10 @@ const ALPHABET: [char; 36] = [
     'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 impl Dummy<UniqueEmail> for String {
-    fn dummy_with_rng<R: rand::Rng +?Sized>(_: &UniqueEmail, rng: &mut R) -> String {
+    fn dummy_with_rng<R: rand::Rng + ?Sized>(_: &UniqueEmail, rng: &mut R) -> String {
         let email: String = SafeEmail().fake_with_rng(rng);
         let id = nanoid!(8, &ALPHABET);
         let at = email.find('@').unwrap();
-        format!("{}.{}@{}", &email[..at], id, &email[at+1..])
+        format!("{}.{}@{}", &email[..at], id, &email[at + 1..])
     }
 }
